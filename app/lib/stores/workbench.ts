@@ -60,6 +60,10 @@ export class WorkbenchStore {
     return this.#filesStore.files;
   }
 
+  get uploadedFiles() {
+    return this.#filesStore.uploadedFiles;
+  }
+
   get currentDocument(): ReadableAtom<EditorDocument | undefined> {
     return this.#editorStore.currentDocument;
   }
@@ -91,7 +95,6 @@ export class WorkbenchStore {
     this.#terminalStore.attachTerminal(terminal);
   }
   attachBoltTerminal(terminal: ITerminal) {
-
     this.#terminalStore.attachBoltTerminal(terminal);
   }
 
@@ -223,6 +226,14 @@ export class WorkbenchStore {
     this.#filesStore.resetFileModifications();
   }
 
+  async uploadFile(file: File) {
+    await this.#filesStore.uploadFile(file);
+  }
+
+  async loadFromFileSystem(handle: FileSystemDirectoryHandle) {
+    await this.#filesStore.loadFromFileSystem(handle);
+  }
+
   abortAllActions() {
     // TODO: what do we wanna do and how do we wanna recover from this?
   }
@@ -312,22 +323,16 @@ export class WorkbenchStore {
 
     for (const [filePath, dirent] of Object.entries(files)) {
       if (dirent?.type === 'file' && !dirent.isBinary) {
-        // remove '/home/project/' from the beginning of the path
         const relativePath = filePath.replace(/^\/home\/project\//, '');
-
-        // split the path into segments
         const pathSegments = relativePath.split('/');
 
-        // if there's more than one segment, we need to create folders
         if (pathSegments.length > 1) {
           let currentFolder = zip;
-
           for (let i = 0; i < pathSegments.length - 1; i++) {
             currentFolder = currentFolder.folder(pathSegments[i])!;
           }
           currentFolder.file(pathSegments[pathSegments.length - 1], dirent.content);
         } else {
-          // if there's only one segment, it's a file in the root
           zip.file(relativePath, dirent.content);
         }
       }
@@ -351,10 +356,7 @@ export class WorkbenchStore {
           currentHandle = await currentHandle.getDirectoryHandle(pathSegments[i], { create: true });
         }
 
-        // create or get the file
         const fileHandle = await currentHandle.getFileHandle(pathSegments[pathSegments.length - 1], { create: true });
-
-        // write the file content
         const writable = await fileHandle.createWritable();
         await writable.write(dirent.content);
         await writable.close();
@@ -367,28 +369,22 @@ export class WorkbenchStore {
   }
 
   async pushToGitHub(repoName: string, githubUsername: string, ghToken: string) {
-
     try {
-      // Get the GitHub auth token from environment variables
       const githubToken = ghToken;
-
       const owner = githubUsername;
 
       if (!githubToken) {
         throw new Error('GitHub token is not set in environment variables');
       }
 
-      // Initialize Octokit with the auth token
       const octokit = new Octokit({ auth: githubToken });
 
-      // Check if the repository already exists before creating it
       let repo: RestEndpointMethodTypes["repos"]["get"]["response"]['data']
       try {
         let resp = await octokit.repos.get({ owner: owner, repo: repoName });
         repo = resp.data
       } catch (error) {
         if (error instanceof Error && 'status' in error && error.status === 404) {
-          // Repository doesn't exist, so create a new one
           const { data: newRepo } = await octokit.repos.createForAuthenticatedUser({
             name: repoName,
             private: false,
@@ -397,17 +393,15 @@ export class WorkbenchStore {
           repo = newRepo;
         } else {
           console.log('cannot create repo!');
-          throw error; // Some other error occurred
+          throw error;
         }
       }
 
-      // Get all files
       const files = this.files.get();
       if (!files || Object.keys(files).length === 0) {
         throw new Error('No files found to push');
       }
 
-      // Create blobs for each file
       const blobs = await Promise.all(
         Object.entries(files).map(async ([filePath, dirent]) => {
           if (dirent?.type === 'file' && dirent.content) {
@@ -422,21 +416,19 @@ export class WorkbenchStore {
         })
       );
 
-      const validBlobs = blobs.filter(Boolean); // Filter out any undefined blobs
+      const validBlobs = blobs.filter(Boolean);
 
       if (validBlobs.length === 0) {
         throw new Error('No valid files to push');
       }
 
-      // Get the latest commit SHA (assuming main branch, update dynamically if needed)
       const { data: ref } = await octokit.git.getRef({
         owner: repo.owner.login,
         repo: repo.name,
-        ref: `heads/${repo.default_branch || 'main'}`, // Handle dynamic branch
+        ref: `heads/${repo.default_branch || 'main'}`,
       });
       const latestCommitSha = ref.object.sha;
 
-      // Create a new tree
       const { data: newTree } = await octokit.git.createTree({
         owner: repo.owner.login,
         repo: repo.name,
@@ -449,7 +441,6 @@ export class WorkbenchStore {
         })),
       });
 
-      // Create a new commit
       const { data: newCommit } = await octokit.git.createCommit({
         owner: repo.owner.login,
         repo: repo.name,
@@ -458,11 +449,10 @@ export class WorkbenchStore {
         parents: [latestCommitSha],
       });
 
-      // Update the reference
       await octokit.git.updateRef({
         owner: repo.owner.login,
         repo: repo.name,
-        ref: `heads/${repo.default_branch || 'main'}`, // Handle dynamic branch
+        ref: `heads/${repo.default_branch || 'main'}`,
         sha: newCommit.sha,
       });
 
@@ -472,12 +462,25 @@ export class WorkbenchStore {
     }
   }
 
-  addCustomFile: () => void = () => {
-    return;
+  addCustomFile = async () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.onchange = async (e) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        await this.uploadFile(file);
+      }
+    };
+    input.click();
   };
 
-  addCustomFolder: () => void = () => {
-    return;
+  addCustomFolder = async () => {
+    try {
+      const handle = await window.showDirectoryPicker();
+      await this.loadFromFileSystem(handle);
+    } catch (error) {
+      console.error('Error loading directory:', error);
+    }
   };
 }
 

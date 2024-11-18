@@ -1,12 +1,10 @@
-// @ts-nocheck
-// Preventing TS checks with files presented in the video for a better presentation.
 import { useStore } from '@nanostores/react';
 import type { Message } from 'ai';
 import { useChat } from 'ai/react';
 import { useAnimate } from 'framer-motion';
 import { memo, useEffect, useRef, useState } from 'react';
 import { cssTransition, toast, ToastContainer } from 'react-toastify';
-import { useMessageParser, usePromptEnhancer, useShortcuts, useSnapScroll } from '~/lib/hooks';
+import { useMessageParser, usePromptEnhancer, useShortcuts, useSnapScroll, useFileUploads } from '~/lib/hooks';
 import { useChatHistory } from '~/lib/persistence';
 import { chatStore } from '~/lib/stores/chat';
 import { workbenchStore } from '~/lib/stores/workbench';
@@ -42,9 +40,6 @@ export function Chat() {
           );
         }}
         icon={({ type }) => {
-          /**
-           * @todo Handle more types if we need them. This may require extra color palettes.
-           */
           switch (type) {
             case 'success': {
               return <div className="i-ph:check-bold text-bolt-elements-icon-success text-2xl" />;
@@ -93,7 +88,7 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
   const { messages, isLoading, input, handleInputChange, setInput, stop, append } = useChat({
     api: '/api/chat',
     body: {
-      apiKeys
+      apiKeys,
     },
     onError: (error) => {
       logger.error('Request failed\n\n', error);
@@ -107,67 +102,9 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
 
   const { enhancingPrompt, promptEnhanced, enhancePrompt, resetEnhancer } = usePromptEnhancer();
   const { parsedMessages, parseMessages } = useMessageParser();
+  useFileUploads(messages, storeMessageHistory, parseMessages);
 
   const TEXTAREA_MAX_HEIGHT = chatStarted ? 400 : 200;
-
-  const addCustomFile = async () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-
-    input.onchange = async (e) => {
-      const file = e.target.files[0];
-      const randomID = Math.random().toString(36).substring(2, 15);
-      const fileName = file.name;
-
-      const content = await file.text();
-
-      const newMessage = {
-        id: randomID,
-        role: 'assistant',
-        content: `File Added: ${fileName} <boltArtifact id="${randomID}" title="${fileName}">\n  <boltAction type="file" filePath="${fileName}">\n    ${content}\n  </boltAction>\n</boltArtifact>`,
-        createdAt: Date.now(),
-      };
-
-      messages.push(newMessage);
-      await storeMessageHistory(messages);
-      parseMessages(messages, false);
-    };
-
-    input.click();
-  };
-  workbenchStore.addCustomFile = addCustomFile;
-
-  const addCustomFolder = async () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.webkitdirectory = true;
-    input.multiple = true;
-
-    input.onchange = async (e) => {
-      const files = Array.from(e.target.files);
-
-      for (const file of files) {
-        const randomID = Math.random().toString(36).substring(2, 15);
-        const fileName = file.name;
-
-        const content = await file.text();
-
-        const newMessage = {
-          id: randomID,
-          role: 'assistant',
-          content: `File Added: ${fileName} <boltArtifact id="${randomID}" title="${fileName}">\n  <boltAction type="file" filePath="${fileName}">\n    ${content}\n  </boltAction>\n</boltArtifact>`,
-          createdAt: Date.now(),
-        };
-
-        messages.push(newMessage);
-        await storeMessageHistory(messages);
-        parseMessages(messages, false);
-      }
-    };
-
-    input.click();
-  };
-  workbenchStore.addCustomFolder = addCustomFolder;
 
   useEffect(() => {
     chatStore.setKey('started', initialMessages.length > 0);
@@ -230,13 +167,6 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
       return;
     }
 
-    /**
-     * @note (delm) Usually saving files shouldn't take long but it may take longer if there
-     * many unsaved files. In that case we need to block user input and show an indicator
-     * of some kind so the user is aware that something is happening. But I consider the
-     * happy case to be no unsaved files and I would expect users to save their changes
-     * before they send another message.
-     */
     await workbenchStore.saveAllFiles();
 
     const fileModifications = workbenchStore.getFileModifcations();
@@ -248,19 +178,8 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
     if (fileModifications !== undefined) {
       const diff = fileModificationsToHTML(fileModifications);
 
-      /**
-       * If we have file modifications we append a new user message manually since we have to prefix
-       * the user input with the file modifications and we don't want the new user input to appear
-       * in the prompt. Using `append` is almost the same as `handleSubmit` except that we have to
-       * manually reset the input and we'd have to manually pass in file attachments. However, those
-       * aren't relevant here.
-       */
       append({ role: 'user', content: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${diff}\n\n${_input}` });
 
-      /**
-       * After sending a new message we reset all modifications since the model
-       * should now be aware of all the changes.
-       */
       workbenchStore.resetAllFileModifications();
     } else {
       append({ role: 'user', content: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${_input}` });

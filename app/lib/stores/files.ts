@@ -8,6 +8,7 @@ import { WORK_DIR } from '~/utils/constants';
 import { computeFileModifications } from '~/utils/diff';
 import { createScopedLogger } from '~/utils/logger';
 import { unreachable } from '~/utils/unreachable';
+import ignore from 'ignore';
 
 const logger = createScopedLogger('FilesStore');
 
@@ -23,33 +24,22 @@ export interface Folder {
   type: 'folder';
 }
 
+export interface UploadedFile {
+  id: string;
+  path: string;
+  content: string;
+}
+
 type Dirent = File | Folder;
 
 export type FileMap = Record<string, Dirent | undefined>;
 
 export class FilesStore {
   #webcontainer: Promise<WebContainer>;
-
-  /**
-   * Tracks the number of files without folders.
-   */
   #size = 0;
-
-  /**
-   * @note Keeps track all modified files with their original content since the last user message.
-   * Needs to be reset when the user sends another message and all changes have to be submitted
-   * for the model to be aware of the changes.
-   */
   #modifiedFiles: Map<string, string> = import.meta.hot?.data.modifiedFiles ?? new Map();
-
-  /**
-   * Map of files that matches the state of WebContainer.
-   */
   files: MapStore<FileMap> = import.meta.hot?.data.files ?? map({});
-
-  get filesCount() {
-    return this.#size;
-  }
+  uploadedFiles = map<UploadedFile[]>([]);
 
   constructor(webcontainerPromise: Promise<WebContainer>) {
     this.#webcontainer = webcontainerPromise;
@@ -60,6 +50,10 @@ export class FilesStore {
     }
 
     this.#init();
+  }
+
+  get filesCount() {
+    return this.#size;
   }
 
   getFile(filePath: string) {
@@ -78,6 +72,78 @@ export class FilesStore {
 
   resetFileModifications() {
     this.#modifiedFiles.clear();
+  }
+
+  async loadFromFileSystem(sourceHandle: FileSystemDirectoryHandle) {
+    const wc = await this.#webcontainer;
+    let gitignoreContent = '';
+    let ig = ignore();
+
+    try {
+      const gitignoreHandle = await sourceHandle.getFileHandle('.gitignore');
+      const file = await gitignoreHandle.getFile();
+      gitignoreContent = await file.text();
+      ig = ignore().add(gitignoreContent);
+    } catch (error) {
+      ig = ignore().add([
+        'node_modules',
+        '.git',
+        'dist',
+        'build',
+        '.cache',
+        '*.log',
+        '.DS_Store'
+      ]);
+    }
+
+    async function processDirectory(handle: FileSystemDirectoryHandle, currentPath: string = '') {
+      for await (const entry of handle.values()) {
+        const entryPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
+
+        if (ig.ignores(entryPath)) {
+          continue;
+        }
+
+        if (entry.kind === 'file') {
+          const file = await entry.getFile();
+          const content = await file.text();
+          const id = Math.random().toString(36).substring(2, 15);
+
+          const dirPath = nodePath.dirname(entryPath);
+          if (dirPath !== '.') {
+            await wc.fs.mkdir(dirPath, { recursive: true });
+          }
+
+          await wc.fs.writeFile(entryPath, content);
+
+          this.uploadedFiles.set([...this.uploadedFiles.get(), {
+            id,
+            path: entryPath,
+            content
+          }]);
+
+        } else if (entry.kind === 'directory') {
+          await wc.fs.mkdir(entryPath, { recursive: true });
+          await processDirectory.call(this, entry, entryPath);
+        }
+      }
+    }
+
+    await processDirectory.call(this, sourceHandle);
+  }
+
+  async uploadFile(file: File) {
+    const wc = await this.#webcontainer;
+    const content = await file.text();
+    const id = Math.random().toString(36).substring(2, 15);
+
+    await wc.fs.writeFile(file.name, content);
+
+    this.uploadedFiles.set([...this.uploadedFiles.get(), {
+      id,
+      path: file.name,
+      content
+    }]);
   }
 
   async saveFile(filePath: string, content: string) {
@@ -102,7 +168,6 @@ export class FilesStore {
         this.#modifiedFiles.set(filePath, oldContent);
       }
 
-      // we immediately update the file and don't rely on the `change` event coming from the watcher
       this.files.setKey(filePath, { type: 'file', content, isBinary: false });
 
       logger.info('File updated');
@@ -126,12 +191,10 @@ export class FilesStore {
     const watchEvents = events.flat(2);
 
     for (const { type, path, buffer } of watchEvents) {
-      // remove any trailing slashes
       const sanitizedPath = path.replace(/\/+$/g, '');
 
       switch (type) {
         case 'add_dir': {
-          // we intentionally add a trailing slash so we can distinguish files from folders in the file tree
           this.files.setKey(sanitizedPath, { type: 'folder' });
           break;
         }
@@ -154,12 +217,6 @@ export class FilesStore {
 
           let content = '';
 
-          /**
-           * @note This check is purely for the editor. The way we detect this is not
-           * bullet-proof and it's a best guess so there might be false-positives.
-           * The reason we do this is because we don't want to display binary files
-           * in the editor nor allow to edit them.
-           */
           const isBinary = isBinaryFile(buffer);
 
           if (!isBinary) {
@@ -176,7 +233,6 @@ export class FilesStore {
           break;
         }
         case 'update_directory': {
-          // we don't care about these events
           break;
         }
       }
@@ -205,16 +261,8 @@ function isBinaryFile(buffer: Uint8Array | undefined) {
   return getEncoding(convertToBuffer(buffer), { chunkLength: 100 }) === 'binary';
 }
 
-/**
- * Converts a `Uint8Array` into a Node.js `Buffer` by copying the prototype.
- * The goal is to  avoid expensive copies. It does create a new typed array
- * but that's generally cheap as long as it uses the same underlying
- * array buffer.
- */
 function convertToBuffer(view: Uint8Array): Buffer {
   const buffer = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-
   Object.setPrototypeOf(buffer, Buffer.prototype);
-
   return buffer as Buffer;
 }
